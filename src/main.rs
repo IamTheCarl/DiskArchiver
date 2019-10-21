@@ -39,6 +39,14 @@ use std::path::Path;
 
 extern crate tempfile_fast;
 
+// Depends on the following being installed;
+//  libdvdcss - driver to decode DVDs
+//  lsscsi    - to discover disk drives.
+//  blkid     - to discover if disks are in drives.
+//  eject     - optional, to open and close drives
+
+// If you keep getting IO errors, you may need to set your computer's DVD region.
+
 enum DiskInfoError {
     LaunchFail,   // Failed to launch application. No permission, out of memory, not installed, something else?
     ConvertToUTF, // Application output was not valid UTF8.
@@ -57,6 +65,9 @@ enum DriveStatus {
 
     CopyWriteError,
     CopyReadError,
+    NonFatalCopyWriteError,
+    NonFatalCopyReadError,
+    IsoFetchError,
 }
 
 struct DiskDrive {
@@ -74,7 +85,8 @@ struct ISOInfo {
 
 enum CopyError {
     Read,
-    Write
+    Write,
+    None
 }
 
 pub type ParserResult<'a, O> = IResult<&'a str, O, VerboseError<&'a str>>;
@@ -121,6 +133,9 @@ fn get_drive_status_message_string(status: &DriveStatus) -> &'static str {
 
         DriveStatus::CopyReadError => "Error reading disk.",
         DriveStatus::CopyWriteError => "Error writing to output file.",
+        DriveStatus::NonFatalCopyWriteError => "Non fatal error reading disk. Copy will continue but its going to be slow.",
+        DriveStatus::NonFatalCopyReadError => "Non fatal error writing to output file. Copy will continue but its going to be slow.",
+        DriveStatus::IsoFetchError => "Failed to fetch ISO data from disk drive. Is the isoinfo command installed?",
     };
 
     message
@@ -208,10 +223,12 @@ fn fetch_iso_info(drive: &str) -> Result<ISOInfo, DiskInfoError> {
     Ok(result)
 }
 
-fn copy_disk_to_iso<I, O, CB>(source: &mut I, target: &mut O, length: usize, buffer_len: usize, mut callback: CB) -> Result<(), CopyError>  where
+fn copy_disk_to_iso<I, O, CB, ECB>(source: &mut I, target: &mut O, length: usize, buffer_len: usize, mut callback: CB, mut error_callback: ECB)
+    -> Result<(), CopyError> where
     I: Read,
     O: Write,
-    CB: FnMut(usize)
+    CB: FnMut(usize),
+    ECB: FnMut(CopyError)
 {
 
     // For testing just dumbly return. Creates a lot of compiler warnings but saves hours waiting for disks to copy.
@@ -227,15 +244,17 @@ fn copy_disk_to_iso<I, O, CB>(source: &mut I, target: &mut O, length: usize, buf
             },
             Ok(len) => {
                 callback(len);
-                len
+                error_callback(CopyError::None);
+                Ok(len)
             },
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
                 continue;
             },
             Err(_) => {
-                return Err(CopyError::Read);
+                // error_callback(CopyError::Read);
+                Err(CopyError::Read) // FIXME Try re-opening the device to see if you can recover.
             }
-        };
+        }?;
 
         target.write_all(&buffer[..len]).map_err(|_| {
             CopyError::Write
@@ -303,7 +322,6 @@ fn add_drive_ui_buttons(drive: &DiskDrive, linear: &mut LinearLayout) {
 
     let buttons = LinearLayout::horizontal()
         .child(Button::new("Eject", move |s| {
-            // TODO check if busy.
             if let Ok(worked) = eject_drive_disk(&drive1) {
                 if worked {
                     s.add_layer(Dialog::text("Disk ejected.")
@@ -388,16 +406,26 @@ fn spawn_drive_thread(s: &mut Cursive, drive: &Arc<DiskDrive>, counter: Counter,
                     text_box.set_content(default_iso_name);
                 })).unwrap();
 
-                let mut progress: f64 = 0.0;
-                let read_scale = 1000.0 / info.length as f64;
-
                 let mut target = tempfile_fast::PersistableTempFile::new_in("./").unwrap();
                 // let mut target = fs::OpenOptions::new().write(true).create(true).open(format!("{}.iso", info.name)).unwrap();
                 let mut source = fs::File::open(&drive.file).unwrap();
 
+                counter.set(0);
+
+                let mut progress: usize = 0;
+                let length = info.length as f64;
+
                 match copy_disk_to_iso(&mut source, &mut target, info.length, info.block_size, |read| {
-                    progress += (read as f64) * read_scale;
-                    counter.set(progress as usize);
+                    progress += read;
+                    counter.set((((progress as f64) / length) * 1000.0) as usize);
+                },
+                |error| {
+                    // Called when there's a non-fatal error.
+                    *drive.status_message.lock().unwrap() = match error {
+                        CopyError::Read => DriveStatus::NonFatalCopyReadError,
+                        CopyError::Write => DriveStatus::NonFatalCopyWriteError,
+                        CopyError::None => DriveStatus::Copying,
+                    };
                 }) {
                     Ok(()) => {
                         *drive.status_message.lock().unwrap() = DriveStatus::WaitingForName;
@@ -418,22 +446,20 @@ fn spawn_drive_thread(s: &mut Cursive, drive: &Arc<DiskDrive>, counter: Counter,
                                 }
                             }
                         }
+
+                        *drive.status_message.lock().unwrap() = DriveStatus::Done;
                     },
                     Err(error) => {
                         *drive.status_message.lock().unwrap() = match error {
                             CopyError::Read => DriveStatus::CopyReadError,
                             CopyError::Write => DriveStatus::CopyWriteError,
+                            CopyError::None => DriveStatus::Copying, // Should never happen.
                         };
                     }
                 }
             } else {
-                // TODO On fail case we should report it.
-                if eject_drive_disk(&drive.file).is_err() {
-                    // TODO report it.
-                }
+                *drive.status_message.lock().unwrap() = DriveStatus::IsoFetchError;
             }
-
-            *drive.status_message.lock().unwrap() = DriveStatus::Done;
 
             // Wait for disk to be removed.
             while drive.has_disk.load(Relaxed) {
@@ -457,11 +483,11 @@ fn add_name_settings(s: &mut Cursive, linear: &mut LinearLayout, name_id: &str, 
 
         let mut status = drive.status_message.lock().unwrap();
 
+        let mut text_box = s.find_id::<EditView>(&name_id).unwrap();
+        let ready_checkbox = s.find_id::<Checkbox>(&ready_id).unwrap();
+
         match *status {
             DriveStatus::WaitingForName => {
-                let text_box = s.find_id::<EditView>(&name_id).unwrap();
-                let ready_checkbox = s.find_id::<Checkbox>(&ready_id).unwrap();
-
                 // Only go through with save if box is checked.
                 if ready_checkbox.is_checked() {
 
@@ -507,15 +533,19 @@ fn add_name_settings(s: &mut Cursive, linear: &mut LinearLayout, name_id: &str, 
             }
             _ => {} // Ignore all other cases.
         }
+
+        // Do not permit editing while we are set as ready.
+        text_box.set_enabled(!ready_checkbox.is_checked());
     });
 }
 
 fn build_main_menu(s: &mut Cursive, drives: &Vec<Arc<DiskDrive>>) {
-    let mut linear = LinearLayout::vertical();
+    let mut root_view = LinearLayout::vertical();
 
     for drive in drives.iter() {
-        let view = TextView::new(&format!("Drive: {}", drive.file));
-        linear.add_child(view);
+
+        // Build drive UI.
+        let mut linear = LinearLayout::vertical();
 
         let progress_id = format!("progress-{}", drive.file);
         let counter = Counter::new(0);
@@ -533,14 +563,13 @@ fn build_main_menu(s: &mut Cursive, drives: &Vec<Arc<DiskDrive>>) {
 
         add_status_indicator(s, drive, &mut linear, &status_id);
 
-        let separator = "=".repeat(80) + ">";
-        let view = TextView::new(&separator).h_align(HAlign::Left);
-        linear.add_child(view);
-
         spawn_drive_thread(s, &drive, counter, &name_id, &ready_id);
+
+        // Now add that to the scrollable list.
+        root_view.add_child(Dialog::around(linear).title(&format!("Drive: {}", drive.file)));
     }
 
-    s.add_fullscreen_layer(Dialog::around(linear.full_width()).title("All Disk Drives").scrollable());
+    s.add_fullscreen_layer(Dialog::around(root_view.full_width()).title("All Disk Drives").scrollable());
     s.set_autorefresh(true);
 
     let drives = drives.clone();

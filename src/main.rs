@@ -36,6 +36,8 @@ use std::sync::Arc;
 use cursive::event::Event;
 use std::sync::Mutex;
 use std::path::Path;
+use std::io::Seek;
+use std::io::SeekFrom;
 
 extern crate tempfile_fast;
 
@@ -63,10 +65,10 @@ enum DriveStatus {
     Saving(String),
     Done,
 
-    CopyWriteError,
-    CopyReadError,
-    NonFatalCopyWriteError,
-    NonFatalCopyReadError,
+    CopyWriteError(String),
+    CopyReadError(String),
+    NonFatalCopyWriteError(String),
+    NonFatalCopyReadError(String),
     IsoFetchError,
 }
 
@@ -84,8 +86,8 @@ struct ISOInfo {
 }
 
 enum CopyError {
-    Read,
-    Write,
+    Read(String),
+    Write(String),
     None
 }
 
@@ -93,49 +95,58 @@ pub type ParserResult<'a, O> = IResult<&'a str, O, VerboseError<&'a str>>;
 
 fn parse_disk_drive_list(input: &str) -> ParserResult<Vec<Arc<DiskDrive>>> {
     let (input, lines) = many0(
-        tuple((
-            preceded(char_tag('['), terminated(take_until("]"), char_tag(']'))),
-            multispace0,
-            terminated(take_until(" "), multispace0),
-            take_until("/"),
             terminated(take_until("\n"), char_tag('\n'))
-        ))
     )(input)?;
 
     let mut drives = Vec::new();
 
     for line in lines {
-        if line.2 == "cd/dvd" {
-            let len = line.4.len();
+        let result: ParserResult<(&str, &str, &str, &str)> = tuple((
+            preceded(char_tag('['), terminated(take_until("]"), char_tag(']'))),
+            multispace0,
+            terminated(take_until(" "), multispace0),
+            take_until("/")
+        ))(line);
 
-            let mut drive = DiskDrive {
-                file: String::from(line.4),
-                has_disk: AtomicBool::new(false),
-                status_message: Mutex::new(DriveStatus::Setup),
-            };
-            drive.file.remove(len - 1);
+        match result {
+            Ok(result) => {
+                let (name, result) = result;
+                let (_, _, drive_type, _) = result;
 
-            drives.push(Arc::new(drive));
+                if drive_type == "cd/dvd" {
+                    let len = name.len();
+
+                    let mut drive = DiskDrive {
+                        file: String::from(name),
+                        has_disk: AtomicBool::new(false),
+                        status_message: Mutex::new(DriveStatus::Setup),
+                    };
+                    drive.file.remove(len - 1);
+
+                    drives.push(Arc::new(drive));
+                }
+            },
+            _ => {} // Ignore invalid lines.
         }
     }
 
     Ok((input, drives))
 }
 
-fn get_drive_status_message_string(status: &DriveStatus) -> &'static str {
+fn get_drive_status_message_string(status: &DriveStatus) -> String {
     let message = match status {
-        DriveStatus::Setup => "Setting up...",
-        DriveStatus::NoDisk => "No Disk.",
-        DriveStatus::Copying => "Copying...",
-        DriveStatus::WaitingForName | DriveStatus::ConfirmingName => "Check the \"Settings ready\" box to finish.",
-        DriveStatus::Saving(_) => "Saving...",
-        DriveStatus::Done => "Done.",
+        DriveStatus::Setup => String::from("Setting up..."),
+        DriveStatus::NoDisk => String::from("No Disk."),
+        DriveStatus::Copying => String::from("Copying..."),
+        DriveStatus::WaitingForName | DriveStatus::ConfirmingName => String::from("Check the \"Settings ready\" box to finish."),
+        DriveStatus::Saving(_) => String::from("Saving..."),
+        DriveStatus::Done => String::from("Done."),
 
-        DriveStatus::CopyReadError => "Error reading disk.",
-        DriveStatus::CopyWriteError => "Error writing to output file.",
-        DriveStatus::NonFatalCopyWriteError => "Non fatal error reading disk. Copy will continue but its going to be slow.",
-        DriveStatus::NonFatalCopyReadError => "Non fatal error writing to output file. Copy will continue but its going to be slow.",
-        DriveStatus::IsoFetchError => "Failed to fetch ISO data from disk drive. Is the isoinfo command installed?",
+        DriveStatus::CopyReadError(message) => format!("Error reading disk: {}", message),
+        DriveStatus::CopyWriteError(message) => format!("Error writing to output file: {}", message),
+        DriveStatus::NonFatalCopyWriteError(message) => format!("Non fatal error reading disk: {}", message),
+        DriveStatus::NonFatalCopyReadError(message) => format!("Non fatal error writing to output file: {}", message),
+        DriveStatus::IsoFetchError => String::from("Failed to fetch ISO data from disk drive. Is the isoinfo command installed?"),
     };
 
     message
@@ -223,9 +234,8 @@ fn fetch_iso_info(drive: &str) -> Result<ISOInfo, DiskInfoError> {
     Ok(result)
 }
 
-fn copy_disk_to_iso<I, O, CB, ECB>(source: &mut I, target: &mut O, length: usize, buffer_len: usize, mut callback: CB, mut error_callback: ECB)
+fn copy_disk_to_iso<O, CB, ECB>(source: &str, target: &mut O, length: usize, buffer_len: usize, mut callback: CB, mut error_callback: ECB)
     -> Result<(), CopyError> where
-    I: Read,
     O: Write,
     CB: FnMut(usize),
     ECB: FnMut(CopyError)
@@ -235,10 +245,13 @@ fn copy_disk_to_iso<I, O, CB, ECB>(source: &mut I, target: &mut O, length: usize
     // return Ok(());
 
     let mut buffer = vec![0; buffer_len];
-    let mut source = source.take(length as u64);
+
+    let source_file = fs::File::open(source).unwrap(); // FIXME replace unwrap with a passed error.
+    let mut source_file = source_file.take(length as u64);
+    let mut position = 0;
 
     loop {
-        let len = match source.read(&mut buffer) {
+        let len = match source_file.read(&mut buffer) {
             Ok(0) => {
                 break;
             },
@@ -250,14 +263,21 @@ fn copy_disk_to_iso<I, O, CB, ECB>(source: &mut I, target: &mut O, length: usize
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
                 continue;
             },
-            Err(_) => {
-                // error_callback(CopyError::Read);
-                Err(CopyError::Read) // FIXME Try re-opening the device to see if you can recover.
+            Err(error) => {
+                error_callback(CopyError::Read(format!("{}", error)));
+                // Err(CopyError::Read) // FIXME Try re-opening the device to see if you can recover.
+                let mut new_source = fs::File::open(source).unwrap(); // FIXME replace unwrap with a passed error.
+                new_source.seek(SeekFrom::Start(position as u64)).map_err( |e| { CopyError::Read(format!("{}", e)) } )?;
+                source_file = new_source.take(length as u64);
+
+                continue;
             }
         }?;
 
-        target.write_all(&buffer[..len]).map_err(|_| {
-            CopyError::Write
+        position += len;
+
+        target.write_all(&buffer[..len]).map_err(|e| {
+            CopyError::Write(format!("{}", e))
         })?;
     }
 
@@ -408,22 +428,21 @@ fn spawn_drive_thread(s: &mut Cursive, drive: &Arc<DiskDrive>, counter: Counter,
 
                 let mut target = tempfile_fast::PersistableTempFile::new_in("./").unwrap();
                 // let mut target = fs::OpenOptions::new().write(true).create(true).open(format!("{}.iso", info.name)).unwrap();
-                let mut source = fs::File::open(&drive.file).unwrap();
 
                 counter.set(0);
 
                 let mut progress: usize = 0;
                 let length = info.length as f64;
 
-                match copy_disk_to_iso(&mut source, &mut target, info.length, info.block_size, |read| {
+                match copy_disk_to_iso(&drive.file, &mut target, info.length, info.block_size, |read| {
                     progress += read;
                     counter.set((((progress as f64) / length) * 1000.0) as usize);
                 },
                 |error| {
                     // Called when there's a non-fatal error.
                     *drive.status_message.lock().unwrap() = match error {
-                        CopyError::Read => DriveStatus::NonFatalCopyReadError,
-                        CopyError::Write => DriveStatus::NonFatalCopyWriteError,
+                        CopyError::Read(err) => DriveStatus::NonFatalCopyReadError(err),
+                        CopyError::Write(err) => DriveStatus::NonFatalCopyWriteError(err),
                         CopyError::None => DriveStatus::Copying,
                     };
                 }) {
@@ -451,8 +470,8 @@ fn spawn_drive_thread(s: &mut Cursive, drive: &Arc<DiskDrive>, counter: Counter,
                     },
                     Err(error) => {
                         *drive.status_message.lock().unwrap() = match error {
-                            CopyError::Read => DriveStatus::CopyReadError,
-                            CopyError::Write => DriveStatus::CopyWriteError,
+                            CopyError::Read(err) => DriveStatus::CopyReadError(err),
+                            CopyError::Write(err) => DriveStatus::CopyWriteError(err),
                             CopyError::None => DriveStatus::Copying, // Should never happen.
                         };
                     }
